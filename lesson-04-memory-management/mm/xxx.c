@@ -5,25 +5,40 @@
 #include <linux/pci.h>
 #include <linux/version.h>
 #include <linux/init.h>
+#include <linux/time.h>
+#include <linux/time64.h>
+#include <linux/timekeeping.h>
 
 #define LEN_MSG 160
-static char buf_msg[ LEN_MSG + 1 ] = "Hello from module!\n";
+static char buf_msg[ LEN_MSG + 1 ];
+static time64_t prev_read_time = 0;
+
+char* get_time( char* buf )
+{
+  struct timespec64 ts = current_kernel_time64();
+  struct tm tm = {0};
+  time64_t prt = prev_read_time;
+  prev_read_time = ts.tv_sec;
+  if (!prt)
+  {
+    sprintf( buf, "this is first read!\n" );
+  }
+  else
+  {
+    time64_to_tm( prt, 0, &tm );
+    sprintf( buf, "%04ld/%02d/%02d %02d:%02d:%02d\n", tm.tm_year, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec );
+  }
+  return buf;
+}
 
 
 static ssize_t xxx_show( struct class *class, struct class_attribute *attr, char *buf ) {
-   strcpy( buf, buf_msg );
+   strcpy( buf, get_time( buf_msg ) );
    printk( "read %ld\n", (long)strlen( buf ) );
    return strlen( buf );
 }
 
-static ssize_t xxx_store( struct class *class, struct class_attribute *attr, const char *buf, size_t count ) {
-   printk( "write %ld\n", (long)count );
-   strncpy( buf_msg, buf, count );
-   buf_msg[ count ] = '\0';
-   return count;
-}
-
-CLASS_ATTR_RW( xxx );
+CLASS_ATTR_RO( xxx );
 
 static struct class *x_class;
 
