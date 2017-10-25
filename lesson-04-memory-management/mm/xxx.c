@@ -5,21 +5,45 @@
 #include <linux/pci.h>
 #include <linux/version.h>
 #include <linux/init.h>
+#include <linux/timer.h>
 
-#define LEN_MSG 160
-static char buf_msg[ LEN_MSG + 1 ] = "Hello from module!\n";
+static int n1, n2;
+static int n[1];
+static void fib_handler( unsigned long );
+DEFINE_TIMER( mytimer, fib_handler, 0, 0 );
 
+void fib_handler( unsigned long data )
+{
+  if (*n)
+  {
+    int t = n2;
+    n2 = n1 + n2;  
+    if (n2 < 0)
+    {
+      n1 = 0; n2 = 1;
+    }
+    else  
+      n1 = t;
+
+    *n = n2; //atomic
+  }
+  else
+  {
+    n1 = 0; n2 = 1;
+  }
+  
+  mod_timer( &mytimer, jiffies + HZ );
+}
 
 static ssize_t xxx_show( struct class *class, struct class_attribute *attr, char *buf ) {
-   strcpy( buf, buf_msg );
+   sprintf( buf, "fibonacci: %d\n", *n );
    printk( "read %ld\n", (long)strlen( buf ) );
    return strlen( buf );
 }
 
 static ssize_t xxx_store( struct class *class, struct class_attribute *attr, const char *buf, size_t count ) {
-   printk( "write %ld\n", (long)count );
-   strncpy( buf_msg, buf, count );
-   buf_msg[ count ] = '\0';
+   printk( "reset fibonacci\n" );
+   *n = 0;
    return count;
 }
 
@@ -32,11 +56,13 @@ int __init x_init(void) {
    x_class = class_create( THIS_MODULE, "x-class" );
    if( IS_ERR( x_class ) ) printk( "bad class create\n" );
    res = class_create_file( x_class, &class_attr_xxx );
+   mod_timer( &mytimer, jiffies + HZ );
    printk( "'xxx' module initialized\n" );
    return res;
 }
 
 void x_cleanup(void) {
+   del_timer( &mytimer );
    class_remove_file( x_class, &class_attr_xxx );
    class_destroy( x_class );
    return;
