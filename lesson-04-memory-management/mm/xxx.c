@@ -5,21 +5,40 @@
 #include <linux/pci.h>
 #include <linux/version.h>
 #include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/math64.h>
 
 #define LEN_MSG 160
-static char buf_msg[ LEN_MSG + 1 ] = "Hello from module!\n";
+static char buf_msg[ LEN_MSG + 1 ];
+#define FMTSTR "last time is %s\n"
+static uint64_t last_time = 0;
 
+static char* print_time( char* buf )
+{
+  char numstr[32] = {0};
+  if (last_time == 0)
+    strcpy( numstr, "first time" );
+  else
+  {
+    uint64_t lt = last_time;
+    last_time = get_jiffies_64();
+    sprintf( numstr, "%llu sec", div64_u64(last_time - lt , HZ ) );
+  }
+  sprintf( buf, FMTSTR, numstr );
+  return buf;
+}
 
 static ssize_t xxx_show( struct class *class, struct class_attribute *attr, char *buf ) {
-   strcpy( buf, buf_msg );
-   printk( "read %ld\n", (long)strlen( buf ) );
-   return strlen( buf );
+   
+  strcpy( buf, print_time(buf_msg) );
+  printk( "read %ld\n", (long)strlen( buf ) );
+  return strlen( buf );
 }
 
 static ssize_t xxx_store( struct class *class, struct class_attribute *attr, const char *buf, size_t count ) {
    printk( "write %ld\n", (long)count );
-   strncpy( buf_msg, buf, count );
-   buf_msg[ count ] = '\0';
+   //reset interval count
+   last_time = 0;
    return count;
 }
 
