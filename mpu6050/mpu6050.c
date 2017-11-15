@@ -5,6 +5,12 @@
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 
+#include <linux/time.h>
+#include <linux/time64.h>
+#include <linux/timekeeping.h>
+#include <linux/timer.h>
+#include <linux/delay.h>
+
 #include "mpu6050-regs.h"
 
 enum AXES {
@@ -21,9 +27,13 @@ enum VALUE_TYPE {
 };
 
 #define READ_REG_NUM (AXES_NUM * 2 + 1)
+#define READ_DEPTH 10
 
 struct mpu6050_data {
 	struct i2c_client *drv_client;
+	int head;
+	int count;
+	spinlock_t lock;
 	union {
 		struct {
 			int accel[AXES_NUM];
@@ -31,17 +41,56 @@ struct mpu6050_data {
 			int gyro [AXES_NUM];
 		} values;
 		int raw[READ_REG_NUM];
-	} data;
+	} data[READ_DEPTH];
 };
 
-static struct mpu6050_data g_mpu6050_data;
+static const struct i2c_device_id mpu6050_idtable[] = {
+	{ "mpu6050", 0 },
+	{ }
+};
+
 
 static ssize_t show_item(struct class *class, struct class_attribute *attr, char *buf);
+static void tmr_handler(unsigned long);
+
+
+static struct mpu6050_data g_mpu6050_data;
+DECLARE_COMPLETION(has_data);
+
+static struct work_struct read_work;
+
+DEFINE_TIMER( mytimer, tmr_handler, 0, 0 );
+
+MODULE_DEVICE_TABLE(i2c, mpu6050_idtable);
+
+static struct class *attr_class;
+
+static int rate = 1000;
+static int is_buf;
+
+module_param( rate, int, S_IRUGO );
+module_param( is_buf, int, S_IRUGO );
+
+static inline int get_next_pos (int pos, const int depth)
+{
+	int tmp = pos + 1;
+	if (tmp >= depth) {
+		tmp -= depth;
+	}
+	return tmp;
+}
+
+static void mpu6050_data_flush(void)
+{
+	reinit_completion(&has_data);
+	g_mpu6050_data.head = 0;
+	g_mpu6050_data.count = 0;
+}
 
 static int mpu6050_read_data(void)
 {
 	u8 values[READ_REG_NUM * sizeof(u16)];
-	int temp, result, i, *p;
+	int temp, result, i, head, count, *p;
 	struct i2c_client *drv_client = g_mpu6050_data.drv_client;
 
 	if (drv_client == 0)
@@ -55,31 +104,89 @@ static int mpu6050_read_data(void)
 		return -EINVAL;
 	}
 
-	for (i = 0, p = g_mpu6050_data.data.raw; i < READ_REG_NUM * sizeof(u16); i += 2, ++p)
+	head = get_next_pos(g_mpu6050_data.head, READ_DEPTH);
+
+	for (i = 0, p = g_mpu6050_data.data[head].raw; i < READ_REG_NUM * sizeof(u16); i += 2, ++p)
 		*p = (s16) ((u16) values[i] << 8 | (u16)values[i + 1]);
+
+	spin_lock(&g_mpu6050_data.lock);
+	g_mpu6050_data.head = head;
+	count = g_mpu6050_data.count;
+	g_mpu6050_data.count = count + 1;
+	spin_unlock(&g_mpu6050_data.lock);
+
+	dev_info(&drv_client->dev, "sensor data read head %d, count %d\n", g_mpu6050_data.head, g_mpu6050_data.count);
 
 	/* Temperature in degrees C =
 	 * (TEMP_OUT Register Value  as a signed quantity)/340 + 36.53
 	 */
-	temp = g_mpu6050_data.data.values.temperature;
-	g_mpu6050_data.data.values.temperature = (temp + 12420 + 170) / 340;
+	temp = g_mpu6050_data.data[head].values.temperature;
+	g_mpu6050_data.data[head].values.temperature = (temp + 12420 + 170) / 340;
+
+	if ((is_buf && count < READ_DEPTH) || (!is_buf && !count))
+		complete(&has_data);
 
 	dev_info(&drv_client->dev, "sensor data read:\n");
 
 	dev_info(&drv_client->dev, "ACCEL[X,Y,Z] = [%d, %d, %d]\n",
-		g_mpu6050_data.data.values.accel[AXIS_X],
-		g_mpu6050_data.data.values.accel[AXIS_Y],
-		g_mpu6050_data.data.values.accel[AXIS_Z]);
+		g_mpu6050_data.data[head].values.accel[AXIS_X],
+		g_mpu6050_data.data[head].values.accel[AXIS_Y],
+		g_mpu6050_data.data[head].values.accel[AXIS_Z]);
 
 	dev_info(&drv_client->dev, "GYRO[X,Y,Z] = [%d, %d, %d]\n",
-		g_mpu6050_data.data.values.gyro[AXIS_X],
-		g_mpu6050_data.data.values.gyro[AXIS_Y],
-		g_mpu6050_data.data.values.gyro[AXIS_Z]);
+		g_mpu6050_data.data[head].values.gyro[AXIS_X],
+		g_mpu6050_data.data[head].values.gyro[AXIS_Y],
+		g_mpu6050_data.data[head].values.gyro[AXIS_Z]);
 
 	dev_info(&drv_client->dev, "TEMP = %d\n",
-			g_mpu6050_data.data.values.temperature);
+			g_mpu6050_data.data[head].values.temperature);
 
 	return 0;
+}
+
+static int mpu6050_get_data(int *values, int is_buffered)
+{
+	if (is_buffered) {
+		int head, count, tail, diff;
+
+		if (wait_for_completion_interruptible(&has_data)) {
+			pr_info("mpu6050: interrupted\n");
+			return 0;
+		}
+
+		spin_lock(&g_mpu6050_data.lock);
+		head  = g_mpu6050_data.head;
+		count = g_mpu6050_data.count >= READ_DEPTH ? READ_DEPTH : g_mpu6050_data.count;
+		g_mpu6050_data.count = count ? count - 1 : 0;
+		spin_unlock(&g_mpu6050_data.lock);
+
+		if (!count) {
+			pr_err("mpu6050: bad flow\n");
+			return 0;
+		}
+
+		diff = head - count + 1;
+		tail = diff < 0 ? READ_DEPTH - diff : diff;
+		memcpy(values, g_mpu6050_data.data[tail].raw, sizeof(int) * READ_REG_NUM);
+		pr_info("mpu6050: get data copied tail %d count %d\n", tail, count);
+	}
+	else {
+		if (wait_for_completion_interruptible(&has_data)) {
+			pr_info("mpu6050: get data interrupted\n");
+			return 0;
+		}
+		memcpy(values, g_mpu6050_data.data[g_mpu6050_data.head].raw, sizeof(int) * READ_REG_NUM);
+		spin_lock(&g_mpu6050_data.lock);
+		g_mpu6050_data.count = 0;
+		spin_unlock(&g_mpu6050_data.lock);
+		pr_info("mpu6050: get data copied tail %d\n", g_mpu6050_data.head);
+	}
+	return 1;
+}
+
+static void update_values(struct work_struct *unused)
+{
+	mpu6050_read_data();
 }
 
 static int mpu6050_probe(struct i2c_client *drv_client,
@@ -134,11 +241,6 @@ static int mpu6050_remove(struct i2c_client *drv_client)
 	return 0;
 }
 
-static const struct i2c_device_id mpu6050_idtable[] = {
-	{ "mpu6050", 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, mpu6050_idtable);
 
 static struct i2c_driver mpu6050_i2c_driver = {
 	.driver = {
@@ -165,19 +267,30 @@ struct class_attribute class_attr_array[READ_REG_NUM] = {
 static ssize_t show_item(struct class *class, struct class_attribute *attr, char *buf)
 {
 	int index = attr - class_attr_array;
+	int data[READ_REG_NUM] = {0};
 	int value = 0;
 
-	mpu6050_read_data();
+	if (!mpu6050_get_data( data, is_buf))
+		return 0;
 
 	if (index >=0 && index < READ_REG_NUM) {
-		value = g_mpu6050_data.data.raw[index];
+		value = data[index];
 	}
 
 	sprintf(buf, "%d\n", value);
 	return strlen(buf);
 }
 
-static struct class *attr_class;
+static void start_timer(void)
+{
+	mod_timer(&mytimer, jiffies + rate);
+}
+
+static void tmr_handler(unsigned long ticks)
+{
+	start_timer();
+	schedule_work(&read_work);
+}
 
 static int mpu6050_init(void)
 {
@@ -190,6 +303,8 @@ static int mpu6050_init(void)
 		return ret;
 	}
 	pr_info("mpu6050: i2c driver created\n");
+	spin_lock_init(&g_mpu6050_data.lock);
+	mpu6050_data_flush();
 
 	/* Create class */
 	attr_class = class_create(THIS_MODULE, "mpu6050");
@@ -209,6 +324,9 @@ static int mpu6050_init(void)
 	}
 
 	pr_info("mpu6050: sysfs class attributes created\n");
+	INIT_WORK(&read_work, update_values);
+	start_timer();
+	pr_info("mpu6050: timed read started\n");
 
 	pr_info("mpu6050: module loaded\n");
 	return 0;
@@ -216,6 +334,9 @@ static int mpu6050_init(void)
 
 static void mpu6050_exit(void)
 {
+	del_timer(&mytimer);
+	cancel_work_sync(&read_work);
+
 	if (attr_class) {
 		int i;
 
