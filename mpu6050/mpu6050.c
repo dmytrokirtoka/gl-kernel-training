@@ -1,10 +1,11 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/device.h>
+#include <linux/cdev.h>
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
-
+#include <linux/uaccess.h>
 #include <linux/time.h>
 #include <linux/time64.h>
 #include <linux/timekeeping.h>
@@ -65,9 +66,13 @@ MODULE_DEVICE_TABLE(i2c, mpu6050_idtable);
 
 static struct class *attr_class;
 
+static struct cdev my_dev;
+
 static int rate = 1000;
 static int is_buf;
+static int major;
 
+module_param( major, int, S_IRUGO );
 module_param( rate, int, S_IRUGO );
 module_param( is_buf, int, S_IRUGO );
 
@@ -252,6 +257,33 @@ static struct i2c_driver mpu6050_i2c_driver = {
 	.id_table = mpu6050_idtable,
 };
 
+static ssize_t dev_read( struct file * file, char * buf, size_t count, loff_t *ppos )
+{
+	int res;
+	int data[READ_REG_NUM];
+
+	if( count != READ_REG_NUM * sizeof(int) )
+		return -EINVAL;
+
+	res = mpu6050_get_data(data, is_buf);
+
+	if (res != 1)
+	{
+		printk("read result %d\n", res);
+		return -EIO;
+	}
+
+	if( copy_to_user( buf, data, READ_REG_NUM * sizeof(int) ) )
+		return -EINVAL;
+
+	return READ_REG_NUM * sizeof(int);
+}
+
+static const struct file_operations dev_fops = {
+	.owner = THIS_MODULE,
+	.read  = dev_read,
+};
+
 struct class_attribute class_attr_array[READ_REG_NUM] = {
 	{ .attr = { .name = "accel_x", .mode = S_IRUGO }, .show = &show_item, },
 	{ .attr = { .name = "accel_y", .mode = S_IRUGO }, .show = &show_item, },
@@ -295,6 +327,7 @@ static void tmr_handler(unsigned long ticks)
 static int mpu6050_init(void)
 {
 	int ret, i;
+	dev_t dev;
 
 	/* Create i2c driver */
 	ret = i2c_add_driver(&mpu6050_i2c_driver);
@@ -306,6 +339,23 @@ static int mpu6050_init(void)
 	spin_lock_init(&g_mpu6050_data.lock);
 	mpu6050_data_flush();
 
+	ret = alloc_chrdev_region(&dev, 0, 1, "gl_mpu6050");
+	major = MAJOR(dev);
+	if( ret < 0 ) {
+		pr_err("mpu6050: can not register char device\n");
+		return ret;
+	}
+
+	cdev_init(&my_dev, &dev_fops);
+	my_dev.owner = THIS_MODULE;
+
+	ret = cdev_add(&my_dev, dev, 1);
+	if( ret < 0 ) {
+		unregister_chrdev_region( MKDEV( major, 0 ), 1 );
+		pr_err("mpu6050: can not add char device\n" );
+		return ret;
+	}
+
 	/* Create class */
 	attr_class = class_create(THIS_MODULE, "mpu6050");
 	if (IS_ERR(attr_class)) {
@@ -314,6 +364,8 @@ static int mpu6050_init(void)
 		return ret;
 	}
 	pr_info("mpu6050: sysfs class created\n");
+
+	device_create(attr_class, NULL, dev, NULL, "mpu6050_0" );
 
 	for (i = 0; i < READ_REG_NUM; ++i) {
 		ret = class_create_file(attr_class, &class_attr_array[i]);
@@ -324,6 +376,7 @@ static int mpu6050_init(void)
 	}
 
 	pr_info("mpu6050: sysfs class attributes created\n");
+
 	INIT_WORK(&read_work, update_values);
 	start_timer();
 	pr_info("mpu6050: timed read started\n");
@@ -339,14 +392,20 @@ static void mpu6050_exit(void)
 
 	if (attr_class) {
 		int i;
+		dev_t dev = MKDEV( major, 0 );
 
 		for (i = 0; i < READ_REG_NUM; ++i) {
 			class_remove_file(attr_class, &class_attr_array[i]);
 		}
 		pr_info("mpu6050: sysfs class attributes removed\n");
 
+		device_destroy( attr_class, dev );
+
 		class_destroy(attr_class);
 		pr_info("mpu6050: sysfs class destroyed\n");
+
+		cdev_del( &my_dev );
+		unregister_chrdev_region( MKDEV( major, 0 ), 1 );
 	}
 
 	i2c_del_driver(&mpu6050_i2c_driver);
