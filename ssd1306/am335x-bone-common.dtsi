@@ -252,6 +252,12 @@
 	status = "okay";
 	clock-frequency = <100000>;
 
+	i2c_ssd1306: i2c_ssd1306@3c {
+		compatible = "gl,i2c_ssd1306";
+		reg = <0x3c>;
+		status = "okay";
+	};
+
 	cape_eeprom0: cape_eeprom0@54 {
 		compatible = "at,24c256";
 		reg = <0x54>;
