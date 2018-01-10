@@ -2,8 +2,17 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
+#include <linux/string.h>
+#include <linux/mm.h>
+#include <linux/vmalloc.h>
+#include <linux/slab.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
+#include <linux/fb.h>
+
+#include <linux/delay.h>
+#include <linux/uaccess.h>
+
 #include <linux/platform_device.h>
 
 #define CMD_ADDR			0
@@ -33,6 +42,16 @@
 #define CHECK_STATUS_REG_VAL		0x43
 
 #define MYDEVNAME    "i2c_ssd1306"
+#define LCD_WIDTH    128
+#define LCD_HEIGHT   64
+#define LCD_BPP      8
+
+struct my_device {
+	struct i2c_client  *client;
+	struct fb_info     *fb_info;
+	u8                 *vmem;
+	size_t              vmsize;
+};
 
 static const struct i2c_device_id i2c_ssd1306_idtable[] = {
 	{ MYDEVNAME, 0 },
@@ -102,9 +121,92 @@ static int i2c_ssd1306_init(struct i2c_client *drv_client)
 	return 0;
 }
 
+static ssize_t i2c_ssd1306_write(struct fb_info *info,
+		const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct i2c_client *drv_client;
+	struct my_device *md = info->par;
+
+	if (!md)
+		return -EINVAL;
+
+	drv_client = md->client;
+	dev_info(&drv_client->dev, "%s: enter\n", __func__);
+
+	return 0;
+}
+
+static int i2c_ssd1306_blank(int blank_mode, struct fb_info *info)
+{
+	struct i2c_client *drv_client;
+	struct my_device *md = info->par;
+
+	if (!md)
+		return -EINVAL;
+
+	drv_client = md->client;
+	dev_info(&drv_client->dev, "%s: enter\n", __func__);
+	return -1;
+}
+
+static void i2c_ssd1306_fillrect(struct fb_info *info,
+		const struct fb_fillrect *rect)
+{
+	struct i2c_client *drv_client;
+	struct my_device *md = info->par;
+
+	if (!md)
+		return;
+
+	drv_client = md->client;
+	dev_info(&drv_client->dev, "%s: enter\n", __func__);
+}
+
+static void i2c_ssd1306_copyarea(struct fb_info *info,
+		const struct fb_copyarea *area)
+{
+	struct i2c_client *drv_client;
+	struct my_device *md = info->par;
+
+	if (!md)
+		return;
+
+	drv_client = md->client;
+	dev_info(&drv_client->dev, "%s: enter\n", __func__);
+}
+
+static void i2c_ssd1306_imageblit(struct fb_info *info,
+		const struct fb_image *image)
+{
+	struct i2c_client *drv_client;
+	struct my_device *md = info->par;
+
+	if (!md)
+		return;
+
+	drv_client = md->client;
+	dev_info(&drv_client->dev, "%s: enter\n", __func__);
+}
+
+static struct fb_ops fb_ops = {
+	.owner          = THIS_MODULE,
+	.fb_read        = fb_sys_read,
+	.fb_write       = i2c_ssd1306_write,
+	.fb_blank       = i2c_ssd1306_blank,
+	.fb_fillrect    = i2c_ssd1306_fillrect,
+	.fb_copyarea    = i2c_ssd1306_copyarea,
+	.fb_imageblit   = i2c_ssd1306_imageblit,
+};
+
 static int i2c_ssd1306_probe(struct i2c_client *drv_client,
 			 const struct i2c_device_id *id)
 {
+	struct fb_info   *fb_info;
+	struct my_device *md;
+	u8               *vmem;
+	size_t            vmem_size;
+	int               err;
+
 	dev_info(&drv_client->dev, "init I2C driver client address %d\n",
 			drv_client->addr);
 
@@ -113,7 +215,68 @@ static int i2c_ssd1306_probe(struct i2c_client *drv_client,
 		return -1;
 	}
 
+	vmem_size = LCD_WIDTH * LCD_HEIGHT * LCD_BPP / 8;
+	vmem = vzalloc(vmem_size);
+	if (!vmem) {
+		dev_info(&drv_client->dev,
+				"vzalloc error size: %d\n", vmem_size);
+		return -ENOMEM;
+	}
+
+	fb_info = framebuffer_alloc(sizeof(struct my_device), &drv_client->dev);
+	if (!fb_info) {
+		dev_info(&drv_client->dev, "framebuffer_alloc error\n");
+		err = -ENOMEM;
+		goto error;
+	}
+
+	fb_info->fbops = &fb_ops;
+	fb_info->screen_base = (u8 __force __iomem *)vmem;
+	fb_info->fix.smem_start = __pa(vmem);
+	fb_info->fix.smem_len = vmem_size;
+
+	i2c_set_clientdata(drv_client, fb_info->par);
+
+	md = fb_info->par;
+	md->fb_info = fb_info;
+	md->client = drv_client;
+	md->vmsize = vmem_size;
+	md->vmem = vmem;
+
+	strncpy(fb_info->fix.id, MYDEVNAME, 16);
+	fb_info->fix.type   = FB_TYPE_PACKED_PIXELS;
+	fb_info->fix.visual = FB_VISUAL_MONO10;
+	fb_info->fix.accel  = FB_ACCEL_NONE;
+	fb_info->fix.line_length = LCD_WIDTH;
+
+	fb_info->var.bits_per_pixel = LCD_BPP;
+	fb_info->var.xres = LCD_WIDTH;
+	fb_info->var.xres_virtual = LCD_WIDTH;
+	fb_info->var.yres = LCD_HEIGHT;
+	fb_info->var.yres_virtual = LCD_HEIGHT;
+
+	fb_info->var.red.length = 1;
+	fb_info->var.red.offset = 0;
+	fb_info->var.green.length = 1;
+	fb_info->var.green.offset = 0;
+	fb_info->var.blue.length = 1;
+	fb_info->var.blue.offset = 0;
+
+	err = register_framebuffer(fb_info);
+	if (err) {
+		dev_err(&drv_client->dev, "Couldn't register the framebuffer\n");
+		goto error;
+	}
+
+	md->th = kthread_run(update_display_thread, md, "i2c_ssd1306_thread");
+	dev_info(&drv_client->dev, "%s: thread %p started\n", __func__, md->th);
+
+	dev_info(&drv_client->dev, "ssd1306 driver successfully loaded\n");
 	return 0;
+
+error:
+	vfree(vmem);
+	return err;
 }
 
 static int i2c_ssd1306_remove(struct i2c_client *drv_client)
