@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 
 #include <linux/platform_device.h>
+#include <linux/kthread.h>
 
 #define CMD_ADDR			0
 
@@ -45,12 +46,15 @@
 #define LCD_WIDTH    128
 #define LCD_HEIGHT   64
 #define LCD_BPP      8
+#define SYNC_RATE_MS 50
 
 struct my_device {
 	struct i2c_client  *client;
 	struct fb_info     *fb_info;
+	struct task_struct *th;
 	u8                 *vmem;
 	size_t              vmsize;
+	atomic_t            dirty;
 };
 
 static const struct i2c_device_id i2c_ssd1306_idtable[] = {
@@ -121,11 +125,17 @@ static int i2c_ssd1306_init(struct i2c_client *drv_client)
 	return 0;
 }
 
+static inline void set_dirty(struct my_device *md)
+{
+	atomic_inc(&(md->dirty));
+}
+
 static ssize_t i2c_ssd1306_write(struct fb_info *info,
 		const char __user *buf, size_t count, loff_t *ppos)
 {
 	struct i2c_client *drv_client;
 	struct my_device *md = info->par;
+	int cnt;
 
 	if (!md)
 		return -EINVAL;
@@ -133,7 +143,14 @@ static ssize_t i2c_ssd1306_write(struct fb_info *info,
 	drv_client = md->client;
 	dev_info(&drv_client->dev, "%s: enter\n", __func__);
 
-	return 0;
+	cnt = fb_sys_write(info, buf, count, ppos);
+
+	if (cnt < 0)
+		return cnt;
+
+	set_dirty(md);
+
+	return cnt;
 }
 
 static int i2c_ssd1306_blank(int blank_mode, struct fb_info *info)
@@ -186,6 +203,50 @@ static void i2c_ssd1306_imageblit(struct fb_info *info,
 
 	drv_client = md->client;
 	dev_info(&drv_client->dev, "%s: enter\n", __func__);
+}
+
+static void copy_byte_to_bit_data(u8 *dst, u8 *src, int size)
+{
+	int i, j, k;
+	u8 buf;
+
+	for (i = 0; i < LCD_HEIGHT / 8; ++i) {
+		for (j = 0; j < LCD_WIDTH; ++j) {
+			for (buf = 0, k = 0; k < 8; ++k)
+				buf |= src[
+				j +
+				k * LCD_WIDTH +
+				i * LCD_WIDTH * 8] > 0x7f ? 1 << k : 0;
+			*dst++ = buf;
+		}
+	}
+}
+
+static int update_display_thread(void *data)
+{
+	static u8 out[LCD_WIDTH * LCD_HEIGHT / 8 + 1];
+	struct my_device *md = (struct my_device *) data;
+
+	pr_info("thread started\n");
+	do {
+		if (atomic_xchg(&md->dirty, 0)) {
+			if (sizeof(out) - 1 != md->vmsize / 8) {
+				pr_err("error in code %d != %d\n",
+					sizeof(out) - 1, md->vmsize / 8);
+				break;
+			}
+			out[0] = SET_START_LINE + 0;
+			copy_byte_to_bit_data(
+					&out[1], md->vmem, md->vmsize);
+			if (i2c_master_send(md->client, out, sizeof(out)) < 0) {
+				pr_err("error send to device\n");
+				break;
+			}
+		}
+		msleep(SYNC_RATE_MS);
+	} while (!kthread_should_stop());
+	pr_info("exit from thread\n");
+	return 0;
 }
 
 static struct fb_ops fb_ops = {
